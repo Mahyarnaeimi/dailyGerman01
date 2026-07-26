@@ -20,6 +20,19 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+# بررسی اینکه سکرت‌ها خالی نمونده باشن (تا به‌جای یه 403 گنگ، پیام واضح بدیم)
+for _name, _value in [
+    ("GEMINI_API_KEY", GEMINI_API_KEY),
+    ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+    ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+]:
+    if not _value or not _value.strip():
+        raise SystemExit(
+            f"❌ Secret '{_name}' خالیه یا درست تنظیم نشده. "
+            f"برو Settings → Secrets and variables → Actions → تب Secrets "
+            f"و مطمئن شو '{_name}' با مقدار درست ساخته شده."
+        )
+
 # ---------------------------------------------------------------------------
 # 1. Daily themes — everyday life situations. Add/remove/edit freely.
 #    The theme is picked deterministically from the day of the year, so it
