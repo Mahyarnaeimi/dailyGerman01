@@ -90,7 +90,7 @@ def generate_content(theme: str) -> str:
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
     )
     response = requests.post(
         url,
