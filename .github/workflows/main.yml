@@ -1,0 +1,57 @@
+name: German Vocabulary Bot (multi-user)
+
+on:
+  schedule:
+    # هر ۵ دقیقه اجرا می‌شه: هم برای خوش‌آمدگویی به اعضای جدید، هم برای
+    # شروع/پیگیری چرخه‌ی روزانه‌ی تم. خودِ اسکریپت تشخیص می‌ده الان
+    # ساعت ۷ صبح اتاواست یا نه و آیا کاری لازمه انجام بشه یا نه.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_daily:
+        description: "شروع فوری چرخه‌ی روزانه (بدون منتظر ماندن برای ساعت ۷ صبح) — برای تست"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # برای commit کردن bot_state.json
+
+concurrency:
+  group: german-bot-run
+  cancel-in-progress: false  # اجازه نده دو اجرا هم‌زمان روی state تداخل کنن
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_DAILY: ${{ github.event.inputs.force_daily == 'true' && '1' || '' }}
+        run: python daily_german_bot.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "german-vocab-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -f bot_state.json ] && ! git diff --quiet -- bot_state.json; then
+            git add bot_state.json
+            git commit -m "Update bot state [skip ci]"
+            git pull --rebase
+            git push
+          else
+            echo "No state changes to commit."
+          fi
