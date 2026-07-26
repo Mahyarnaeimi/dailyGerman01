@@ -1,0 +1,53 @@
+name: Daily German Vocabulary Bot
+
+on:
+  schedule:
+    # Ottawa (America/Toronto) shifts between EDT (UTC-4) and EST (UTC-5).
+    # We trigger at both possible UTC times; the script itself checks the
+    # real Ottawa clock and skips the run that isn't actually 7:00 AM there.
+    - cron: "0 11 * * *"   # 7:00 AM EDT (roughly mid-March to early Nov)
+    - cron: "0 12 * * *"   # 7:00 AM EST (roughly early Nov to mid-March)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Skip the 7am-Ottawa check and run immediately (for testing)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # needed so the workflow can commit themes_history.json back
+
+jobs:
+  send-lesson:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_RUN: ${{ github.event.inputs.force == 'true' && '1' || '' }}
+        run: python daily_german_bot.py
+
+      - name: Commit updated theme history
+        run: |
+          git config user.name "german-vocab-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -f themes_history.json ] && ! git diff --quiet -- themes_history.json; then
+            git add themes_history.json
+            git commit -m "Update theme history [skip ci]"
+            git push
+          else
+            echo "No history changes to commit."
+          fi
