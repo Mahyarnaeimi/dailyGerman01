@@ -1,27 +1,33 @@
 """
 Daily German Vocabulary Telegram Bot (multi-user, shared decision)
 --------------------------------------------------------------------
-Runs every 5 minutes (via GitHub Actions cron). Each run:
+Triggered externally every ~5 minutes via an outside cron service
+(cron-job.org) calling the `workflow_dispatch` API endpoint -- this is
+used INSTEAD OF relying on GitHub's own `schedule:` cron, because
+GitHub silently delays/drops frequent schedule triggers for low-traffic
+repos (observed gaps of 3+ hours in production). workflow_dispatch is
+exactly what the "Run workflow" button uses, which is reliable.
 
-  1. Reads any new Telegram updates.
-       - If someone sends /start -> adds them as a subscriber and
-         welcomes them.
-       - If someone taps a theme button -> that choice is recorded and
-         will apply to EVERYONE (first valid response wins).
-  2. If it's 7:00 AM in Ottawa (handles EDT/EST automatically) and
-     today's daily cycle hasn't started yet -> asks Gemini for 4 new
-     themes (avoiding history) and broadcasts them to every subscriber
-     as buttons.
+Each run:
+  1. Actively polls Telegram for a short window (not just once) so that
+     answers arriving during this run are caught almost immediately.
+       - /start -> subscribes the user, sends a welcome message.
+       - tapping a theme button -> recorded; the FIRST valid response
+         wins and applies to EVERYONE.
+  2. If it's ~7:00 AM in Ottawa (handles EDT/EST automatically) and no
+     cycle is currently in progress -> asks Gemini for 4 new themes
+     (avoiding repeats) and broadcasts them as buttons.
   3. If a cycle is waiting for a response:
        - Someone picked a theme -> generates the vocab lesson and
          broadcasts it to every subscriber.
        - Someone picked "none of these" -> asks Gemini for 4 fresh
          themes and re-broadcasts.
-       - 15 minutes passed with no response -> auto-picks the first
-         suggested theme so the day isn't wasted.
-  4. Saves all state (subscribers, history, in-progress cycle) into
-     bot_state.json. The GitHub Actions workflow commits this file back
-     to the repo so it persists between runs.
+       - Nobody answered yet -> keeps waiting. No timeout, no
+         auto-pick. The NEXT morning's trigger will also just keep
+         waiting on this same pending cycle instead of starting a new
+         one, until someone actually answers.
+  4. Saves all state into bot_state.json, committed back to the repo
+     by the workflow so it persists between runs.
 
 Required environment variables (GitHub Actions secrets):
   TELEGRAM_BOT_TOKEN
@@ -31,12 +37,13 @@ Required environment variables (GitHub Actions secrets):
   GEMINI_API_KEY
 
 Optional:
-  FORCE_DAILY=1   - ignore the "already ran today" / "must be 7am" checks
-                    and kick off a fresh daily cycle right now (testing)
+  FORCE_DAILY=1   - ignore the "already ran" / "must be 7am" checks and
+                    kick off a fresh daily cycle right now (testing)
 """
 
 import os
 import json
+import time
 import datetime
 import requests
 
@@ -51,8 +58,10 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 FORCE_DAILY = os.environ.get("FORCE_DAILY", "").strip() == "1"
 
 STATE_FILE = "bot_state.json"
-RESPONSE_TIMEOUT_MINUTES = 15
 MAX_REJECTION_ROUNDS = 5
+
+ACTIVE_POLL_SECONDS = 50
+ACTIVE_POLL_STEP = 20
 
 for _name, _value in [
     ("GEMINI_API_KEY", GEMINI_API_KEY),
@@ -73,9 +82,6 @@ GEMINI_URL = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Time helpers
-# ---------------------------------------------------------------------------
 def ottawa_now() -> datetime.datetime:
     if ZoneInfo is None:
         return datetime.datetime.utcnow()
@@ -86,15 +92,6 @@ def utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def minutes_since(iso_timestamp: str) -> float:
-    then = datetime.datetime.fromisoformat(iso_timestamp)
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return (now - then).total_seconds() / 60
-
-
-# ---------------------------------------------------------------------------
-# State persistence
-# ---------------------------------------------------------------------------
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
@@ -115,9 +112,6 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-# ---------------------------------------------------------------------------
-# Gemini helpers
-# ---------------------------------------------------------------------------
 def call_gemini(prompt: str) -> str:
     response = requests.post(
         GEMINI_URL,
@@ -190,10 +184,7 @@ def generate_content(theme: str) -> str:
     return call_gemini(prompt)
 
 
-# ---------------------------------------------------------------------------
-# Telegram helpers
-# ---------------------------------------------------------------------------
-def send_to_chat(chat_id: int, text: str, reply_markup: dict | None = None) -> int | None:
+def send_to_chat(chat_id: int, text: str, reply_markup=None):
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
     last_message_id = None
@@ -210,8 +201,7 @@ def send_to_chat(chat_id: int, text: str, reply_markup: dict | None = None) -> i
     return last_message_id
 
 
-def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> dict:
-    """Sends to every subscriber. Returns {chat_id: message_id}."""
+def broadcast(state: dict, text: str, reply_markup=None) -> dict:
     message_ids = {}
     for chat_id in state["subscribers"]:
         mid = send_to_chat(chat_id, text, reply_markup=reply_markup)
@@ -220,13 +210,17 @@ def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> dict:
     return message_ids
 
 
-def get_updates(offset: int) -> list:
-    params = {"timeout": 0}
+def get_updates(offset: int, timeout: int = 0) -> list:
+    params = {"timeout": timeout}
     if offset:
         params["offset"] = offset
-    r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=15)
-    r.raise_for_status()
-    return r.json().get("result", [])
+    try:
+        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=timeout + 15)
+        r.raise_for_status()
+        return r.json().get("result", [])
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: getUpdates failed: {e}")
+        return []
 
 
 def answer_callback(callback_query_id: str, text: str = "") -> None:
@@ -249,65 +243,78 @@ def make_theme_keyboard(themes: list) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Update processing (subscribers + callback answers)
-# ---------------------------------------------------------------------------
-def process_updates(state: dict) -> None:
-    updates = get_updates(offset=state.get("update_offset", 0))
-    for update in updates:
-        state["update_offset"] = update["update_id"] + 1
+def handle_single_update(state: dict, update: dict) -> None:
+    message = update.get("message") or {}
+    text = str(message.get("text") or "").strip()
+    if text.lower().startswith("/start"):
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if chat_id is None:
+            return
+        first_name = chat.get("first_name") or "دوست عزیز"
+        if chat_id not in state["subscribers"]:
+            state["subscribers"].append(chat_id)
+            send_to_chat(
+                chat_id,
+                f"سلام {first_name}! 👋 خوش اومدی به ربات یادگیری واژگان آلمانی.\n\n"
+                "هر روز صبح یه تم پیشنهاد می‌شه؛ هرکی از اعضا زودتر جواب بده، "
+                "همون برای همه اعمال می‌شه و صفت/فعل‌های آلمانی مرتبط با مثال و "
+                "معادل انگلیسی براتون میاد. فقط کافیه منتظر پیام بعدی بمونی 🇩🇪",
+            )
+        else:
+            send_to_chat(chat_id, "قبلاً عضو بودی، لازم نیست دوباره /start بزنی 😊")
+        return
 
-        message = update.get("message")
-        if message and str(message.get("text", "")).strip().lower().startswith("/start"):
-            chat_id = message["chat"]["id"]
-            first_name = message["chat"].get("first_name", "دوست عزیز")
-            if chat_id not in state["subscribers"]:
-                state["subscribers"].append(chat_id)
-                send_to_chat(
-                    chat_id,
-                    f"سلام {first_name}! 👋 خوش اومدی به ربات یادگیری واژگان آلمانی.\n\n"
-                    "هر روز صبح یه تم پیشنهاد می‌شه؛ هرکی از اعضا زودتر جواب بده، "
-                    "همون برای همه اعمال می‌شه و صفت/فعل‌های آلمانی مرتبط با مثال و "
-                    "معادل انگلیسی براتون میاد. فقط کافیه منتظر پیام بعدی بمونی 🇩🇪",
-                )
-            else:
-                send_to_chat(chat_id, "قبلاً عضو بودی، لازم نیست دوباره /start بزنی 😊")
+    cq = update.get("callback_query")
+    if not cq:
+        return
 
-        cq = update.get("callback_query")
-        if not cq:
-            continue
+    daily = state["daily"]
+    if daily.get("status") != "awaiting":
+        answer_callback(cq.get("id", ""), "این گزینه‌ها دیگه فعال نیستن.")
+        return
+    if daily.get("pending_choice"):
+        answer_callback(cq.get("id", ""), "قبلاً یکی جواب داده بود ✅")
+        return
 
-        daily = state["daily"]
-        if daily.get("status") != "awaiting":
-            answer_callback(cq["id"], "این گزینه‌ها دیگه فعال نیستن.")
-            continue
-        if daily.get("pending_choice"):
-            # Someone already answered this round; just acknowledge.
-            answer_callback(cq["id"], "قبلاً یکی جواب داده بود ✅")
-            continue
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id")
+    expected_id = daily.get("message_ids", {}).get(str(chat_id))
+    if expected_id != message_id:
+        answer_callback(cq.get("id", ""), "این گزینه‌ها دیگه فعال نیستن.")
+        return
 
-        msg = cq.get("message", {})
-        chat_id = msg.get("chat", {}).get("id")
-        message_id = msg.get("message_id")
-        expected_id = daily.get("message_ids", {}).get(str(chat_id))
-        if expected_id != message_id:
-            # Stale button from a previous round.
-            answer_callback(cq["id"], "این گزینه‌ها دیگه فعال نیستن.")
-            continue
-
-        data = cq.get("data", "")
-        answer_callback(cq["id"], "گرفتم ✅")
-        if data == "theme_none":
-            daily["pending_choice"] = "none"
-        elif data.startswith("theme_"):
+    data = cq.get("data", "")
+    answer_callback(cq.get("id", ""), "گرفتم ✅")
+    if data == "theme_none":
+        daily["pending_choice"] = "none"
+    elif data.startswith("theme_"):
+        try:
             idx = int(data.split("_")[1])
-            if 0 <= idx < len(daily.get("themes", [])):
-                daily["pending_choice"] = daily["themes"][idx]
+        except (IndexError, ValueError):
+            return
+        if 0 <= idx < len(daily.get("themes", [])):
+            daily["pending_choice"] = daily["themes"][idx]
 
 
-# ---------------------------------------------------------------------------
-# Daily cycle
-# ---------------------------------------------------------------------------
+def process_updates(state: dict) -> None:
+    deadline = time.monotonic() + ACTIVE_POLL_SECONDS
+    while True:
+        updates = get_updates(offset=state.get("update_offset", 0), timeout=ACTIVE_POLL_STEP)
+        for update in updates:
+            state["update_offset"] = update["update_id"] + 1
+            try:
+                handle_single_update(state, update)
+            except Exception as e:
+                print(f"Warning: failed to process update {update.get('update_id')}: {e}")
+
+        if state["daily"].get("pending_choice"):
+            return
+        if time.monotonic() >= deadline:
+            return
+
+
 def start_new_cycle_if_needed(state: dict) -> None:
     now = ottawa_now()
     today_str = now.date().isoformat()
@@ -348,10 +355,8 @@ def progress_cycle_if_needed(state: dict) -> None:
         return
 
     choice = daily.get("pending_choice")
-    timed_out = minutes_since(daily["sent_at"]) >= RESPONSE_TIMEOUT_MINUTES
-
-    if choice is None and not timed_out:
-        return  # still waiting, nothing to do this run
+    if choice is None:
+        return
 
     if choice == "none" and daily.get("rounds", 1) < MAX_REJECTION_ROUNDS:
         rejected = daily.get("rejected", []) + daily.get("themes", [])
@@ -370,13 +375,7 @@ def progress_cycle_if_needed(state: dict) -> None:
         })
         return
 
-    # Decide final theme: a real choice, or timeout/too-many-rejections fallback.
-    if choice and choice != "none":
-        final_theme = choice
-    else:
-        final_theme = daily["themes"][0]
-        broadcast(state, f"جوابی نگرفتم، پس امروز رو خودم انتخاب کردم: *{final_theme}*")
-
+    final_theme = choice if choice != "none" else daily["themes"][0]
     content = generate_content(final_theme)
     broadcast(state, content)
 
@@ -384,9 +383,6 @@ def progress_cycle_if_needed(state: dict) -> None:
     daily["status"] = "done"
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     state = load_state()
     process_updates(state)
