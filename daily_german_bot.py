@@ -56,8 +56,10 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 FORCE_DAILY = os.environ.get("FORCE_DAILY", "").strip() == "1"
+GIST_TOKEN = os.environ["GIST_TOKEN"]
+GIST_ID = os.environ["GIST_ID"]
 
-STATE_FILE = "bot_state.json"
+GIST_FILENAME = "bot_state.json"
 MAX_REJECTION_ROUNDS = 5
 
 ACTIVE_POLL_SECONDS = 50
@@ -67,6 +69,8 @@ for _name, _value in [
     ("GEMINI_API_KEY", GEMINI_API_KEY),
     ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
     ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+    ("GIST_TOKEN", GIST_TOKEN),
+    ("GIST_ID", GIST_ID),
 ]:
     if not _value or not _value.strip():
         raise SystemExit(
@@ -80,6 +84,7 @@ GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
+GIST_API = f"https://api.github.com/gists/{GIST_ID}"
 
 
 def ottawa_now() -> datetime.datetime:
@@ -93,12 +98,17 @@ def utc_now_iso() -> str:
 
 
 def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
+    try:
+        r = requests.get(
+            GIST_API,
+            headers={"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        content = r.json()["files"][GIST_FILENAME]["content"]
+        return json.loads(content)
+    except (requests.exceptions.RequestException, KeyError, json.JSONDecodeError):
+        pass
     return {
         "subscribers": [int(TELEGRAM_CHAT_ID)],
         "update_offset": 0,
@@ -106,10 +116,16 @@ def load_state() -> dict:
         "daily": {"date": None, "status": "idle"},
     }
 
-
 def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    try:
+        requests.patch(
+            GIST_API,
+            headers={"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"},
+            json={"files": {GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: failed to save state to gist: {e}")
 
 
 def call_gemini(prompt: str) -> str:
