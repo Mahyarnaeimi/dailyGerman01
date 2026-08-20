@@ -42,7 +42,7 @@ for _name, _value in [
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
 )
 GIST_API = f"https://api.github.com/gists/{GIST_ID}"
 
