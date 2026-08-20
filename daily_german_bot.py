@@ -1,46 +1,3 @@
-"""
-Daily German Vocabulary Telegram Bot (multi-user, shared decision)
---------------------------------------------------------------------
-Triggered externally every ~5 minutes via an outside cron service
-(cron-job.org) calling the `workflow_dispatch` API endpoint -- this is
-used INSTEAD OF relying on GitHub's own `schedule:` cron, because
-GitHub silently delays/drops frequent schedule triggers for low-traffic
-repos (observed gaps of 3+ hours in production). workflow_dispatch is
-exactly what the "Run workflow" button uses, which is reliable.
-
-Each run:
-  1. Actively polls Telegram for a short window (not just once) so that
-     answers arriving during this run are caught almost immediately.
-       - /start -> subscribes the user, sends a welcome message.
-       - tapping a theme button -> recorded; the FIRST valid response
-         wins and applies to EVERYONE.
-  2. If it's ~7:00 AM in Ottawa (handles EDT/EST automatically) and no
-     cycle is currently in progress -> asks Gemini for 4 new themes
-     (avoiding repeats) and broadcasts them as buttons.
-  3. If a cycle is waiting for a response:
-       - Someone picked a theme -> generates the vocab lesson and
-         broadcasts it to every subscriber.
-       - Someone picked "none of these" -> asks Gemini for 4 fresh
-         themes and re-broadcasts.
-       - Nobody answered yet -> keeps waiting. No timeout, no
-         auto-pick. The NEXT morning's trigger will also just keep
-         waiting on this same pending cycle instead of starting a new
-         one, until someone actually answers.
-  4. Saves all state into bot_state.json, committed back to the repo
-     by the workflow so it persists between runs.
-
-Required environment variables (GitHub Actions secrets):
-  TELEGRAM_BOT_TOKEN
-  TELEGRAM_CHAT_ID     - your own chat id, used to seed the subscriber
-                         list the very first time (before anyone else
-                         has joined)
-  GEMINI_API_KEY
-
-Optional:
-  FORCE_DAILY=1   - ignore the "already ran" / "must be 7am" checks and
-                    kick off a fresh daily cycle right now (testing)
-"""
-
 import os
 import json
 import time
@@ -49,7 +6,7 @@ import requests
 
 try:
     from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover
+except ImportError:
     ZoneInfo = None
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -64,6 +21,9 @@ MAX_REJECTION_ROUNDS = 5
 
 ACTIVE_POLL_SECONDS = 50
 ACTIVE_POLL_STEP = 20
+
+# ساعت شروع ارسال روزانه (به وقت اتاوا) — از این ساعت به بعد ارسال می‌شه
+DAILY_SEND_HOUR = 7  # 7 صبح
 
 for _name, _value in [
     ("GEMINI_API_KEY", GEMINI_API_KEY),
@@ -82,7 +42,7 @@ for _name, _value in [
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 )
 GIST_API = f"https://api.github.com/gists/{GIST_ID}"
 
@@ -115,6 +75,7 @@ def load_state() -> dict:
         "history": [],
         "daily": {"date": None, "status": "idle"},
     }
+
 
 def save_state(state: dict) -> None:
     try:
@@ -331,26 +292,42 @@ def process_updates(state: dict) -> None:
             return
 
 
+def reset_daily_if_new_day(state: dict) -> None:
+    """
+    FIX: اگه روز جدیده و status روی done یا awaiting مونده، ریست کن.
+    این جلوی بلاک شدن روزهای بعدی رو می‌گیره.
+    """
+    now = ottawa_now()
+    today_str = now.date().isoformat()
+    daily = state["daily"]
+    last_date = daily.get("date")
+
+    if last_date and last_date != today_str:
+        print(f"New day detected ({last_date} -> {today_str}), resetting daily state.")
+        state["daily"] = {"date": None, "status": "idle"}
+
+
 def start_new_cycle_if_needed(state: dict) -> None:
     now = ottawa_now()
     today_str = now.date().isoformat()
     daily = state["daily"]
 
     already_ran_today = daily.get("date") == today_str
-    is_seven_am = now.hour == 7
+    is_after_send_hour = now.hour >= DAILY_SEND_HOUR
 
     if FORCE_DAILY:
         should_start = daily.get("status", "idle") == "idle"
     else:
-        should_start = is_seven_am and not already_ran_today and daily.get("status", "idle") == "idle"
+        should_start = is_after_send_hour and not already_ran_today and daily.get("status", "idle") == "idle"
 
     if not should_start:
+        print(f"No new cycle needed. status={daily.get('status')}, already_ran={already_ran_today}, hour={now.hour}")
         return
 
+    print(f"Starting new daily cycle for {today_str}...")
     themes = suggest_new_themes(state["history"], [])
     keyboard = make_theme_keyboard(themes)
-    text = "🇩🇪 تم‌های پیشنهادی امروز رو انتخاب کنید (هرکی زودتر جواب بده، برای همه اعمال می‌شه):\n\n" + \
-        "\n".join(f"{i + 1}. {t}" for i, t in enumerate(themes))
+    text = "🇩🇪 تم‌های پیشنهادی امروز رو انتخاب کنید (هرکی زودتر جواب بده، برای همه اعمال می‌شه):\n\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(themes))
     message_ids = broadcast(state, text, reply_markup=keyboard)
 
     state["daily"] = {
@@ -378,8 +355,7 @@ def progress_cycle_if_needed(state: dict) -> None:
         rejected = daily.get("rejected", []) + daily.get("themes", [])
         new_themes = suggest_new_themes(state["history"], rejected)
         keyboard = make_theme_keyboard(new_themes)
-        text = "باشه، بذار گزینه‌های جدید پیشنهاد بدم 🔄\n\n" + \
-            "\n".join(f"{i + 1}. {t}" for i, t in enumerate(new_themes))
+        text = "باشه، بذار گزینه‌های جدید پیشنهاد بدم 🔄\n\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(new_themes))
         message_ids = broadcast(state, text, reply_markup=keyboard)
         daily.update({
             "themes": new_themes,
@@ -401,6 +377,8 @@ def progress_cycle_if_needed(state: dict) -> None:
 
 def main():
     state = load_state()
+    # FIX: اول چک کن روز جدید شده یا نه — اگه آره، daily رو ریست کن
+    reset_daily_if_new_day(state)
     process_updates(state)
     start_new_cycle_if_needed(state)
     progress_cycle_if_needed(state)
