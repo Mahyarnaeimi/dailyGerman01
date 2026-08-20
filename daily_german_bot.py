@@ -42,7 +42,7 @@ for _name, _value in [
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 GIST_API = f"https://api.github.com/gists/{GIST_ID}"
 
@@ -95,7 +95,9 @@ def call_gemini(prompt: str) -> str:
         json={"contents": [{"parts": [{"text": prompt}]}]},
         timeout=60,
     )
-    response.raise_for_status()
+    if not response.ok:
+        print(f"Gemini API error {response.status_code}: {response.text[:500]}")
+        response.raise_for_status()
     data = response.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
