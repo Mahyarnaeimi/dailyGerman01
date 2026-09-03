@@ -25,6 +25,23 @@ ACTIVE_POLL_STEP = 20
 # ساعت شروع ارسال روزانه (به وقت اتاوا) — از این ساعت به بعد ارسال می‌شه
 DAILY_SEND_HOUR = 7  # 7 صبح
 
+# --- مقاوم‌سازی در برابر خطاهای موقت Gemini ---
+GEMINI_TIMEOUT = 90            # ثانیه (قبلاً ۶۰ بود)
+GEMINI_MAX_ATTEMPTS = 4        # تعداد تلاش‌ها با backoff
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}  # این‌ها موقتی‌ان، retry کن
+
+# اگه Gemini اصلاً جواب نداد، از این تم‌های آماده استفاده می‌شه تا پیام روز از دست نره
+FALLBACK_THEMES = [
+    "جلسه‌ی کاری فشرده: مذاکره روی دیدلاین، ارائه‌ی گزارش پیشرفت، اختلاف نظر با همکار",
+    "ارائه دادن سمینار دانشگاهی: استرس قبل ارائه، جلب توجه مخاطب، جواب دادن به سوالات سخت",
+    "مکاتبات اداری روزمره: نوشتن ایمیل رسمی، پیگیری درخواست، پاسخ دیرهنگام همکار",
+    "کار گروهی روی پروژه‌ی دانشگاهی: تقسیم وظایف، جا ماندن از زمان‌بندی، بازنویسی بخش‌ها",
+    "مصاحبه‌ی شغلی: معرفی خود، پاسخ به سوال درباره‌ی نقاط ضعف، مذاکره‌ی حقوق",
+    "امتحانات پایان‌ترم: آماده شدن شبانه، استرس جلسه‌ی امتحان، فراموش کردن پاسخ",
+    "مدیریت زمان در محل کار: عقب افتادن از برنامه، اولویت‌بندی کارها، تمدید مهلت",
+    "جلسه با استاد راهنما: ارائه‌ی پیشرفت پایان‌نامه، دریافت انتقاد، اصلاح مسیر تحقیق",
+]
+
 for _name, _value in [
     ("GEMINI_API_KEY", GEMINI_API_KEY),
     ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
@@ -90,16 +107,49 @@ def save_state(state: dict) -> None:
 
 
 def call_gemini(prompt: str) -> str:
-    response = requests.post(
-        GEMINI_URL,
-        json={"contents": [{"parts": [{"text": prompt}]}]},
-        timeout=60,
-    )
-    if not response.ok:
-        print(f"Gemini API error {response.status_code}: {response.text[:500]}")
-        response.raise_for_status()
-    data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    """
+    Gemini رو با retry و backoff صدا می‌زنه.
+    خطاهای موقت (429/5xx و تایم‌اوت/قطعی شبکه) رو چند بار دوباره تلاش می‌کنه.
+    خطاهای دائمی (مثل ۴۰۰/۴۰۳/۴۰۴) رو بلافاصله raise می‌کنه چون retry بی‌فایده‌ست.
+    """
+    last_err = None
+    for attempt in range(GEMINI_MAX_ATTEMPTS):
+        try:
+            response = requests.post(
+                GEMINI_URL,
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=GEMINI_TIMEOUT,
+            )
+            if response.status_code in RETRYABLE_STATUS:
+                print(f"Gemini API {response.status_code} (attempt {attempt + 1}/{GEMINI_MAX_ATTEMPTS}): {response.text[:200]}")
+                last_err = requests.exceptions.HTTPError(
+                    f"{response.status_code} retryable", response=response
+                )
+            else:
+                if not response.ok:
+                    print(f"Gemini API error {response.status_code}: {response.text[:500]}")
+                    response.raise_for_status()  # خطای دائمی — بدون retry بالا می‌ره
+                data = response.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            print(f"Gemini network error (attempt {attempt + 1}/{GEMINI_MAX_ATTEMPTS}): {e}")
+            last_err = e
+
+        if attempt < GEMINI_MAX_ATTEMPTS - 1:
+            wait = 5 * (3 ** attempt)  # ۵، ۱۵، ۴۵ ثانیه
+            print(f"Retrying Gemini in {wait}s...")
+            time.sleep(wait)
+
+    raise last_err if last_err is not None else RuntimeError("Gemini call failed")
+
+
+def _pick_fallback_themes(history: list, rejected: list) -> list:
+    """۴ تم از لیست آماده که تو history و rejected نیستن."""
+    used = set(history) | set(rejected)
+    pool = [t for t in FALLBACK_THEMES if t not in used]
+    if len(pool) < 4:
+        pool = pool + [t for t in FALLBACK_THEMES if t not in pool]
+    return pool[:4]
 
 
 def suggest_new_themes(history: list, rejected: list) -> list:
@@ -126,7 +176,12 @@ def suggest_new_themes(history: list, rejected: list) -> list:
 
 فقط آرایه‌ی JSON رو بده."""
 
-    raw = call_gemini(prompt).strip()
+    try:
+        raw = call_gemini(prompt).strip()
+    except Exception as e:
+        print(f"Gemini failed for theme suggestion, using fallback themes: {e}")
+        return _pick_fallback_themes(history, rejected)
+
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
@@ -142,7 +197,10 @@ def suggest_new_themes(history: list, rejected: list) -> list:
         pass
 
     lines = [l.strip("-•* ").strip() for l in raw.splitlines() if l.strip()]
-    return lines[:4] if len(lines) >= 4 else lines + ["تم پیش‌فرض"] * (4 - len(lines))
+    if len(lines) >= 4:
+        return lines[:4]
+    # اگه حتی خروجی هم خراب بود، به fallback برگرد به‌جای تم پیش‌فرض بی‌معنی
+    return _pick_fallback_themes(history, rejected)
 
 
 def generate_content(theme: str) -> str:
@@ -339,6 +397,13 @@ def start_new_cycle_if_needed(state: dict) -> None:
     text = "🇩🇪 تم‌های پیشنهادی امروز رو انتخاب کنید (هرکی زودتر جواب بده، برای همه اعمال می‌شه):\n\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(themes))
     message_ids = broadcast(state, text, reply_markup=keyboard)
 
+    # FIX: اگه هیچ پیامی موفق ارسال نشد، وضعیت رو قفل نکن (awaiting) —
+    # idle نگه دار تا ران بعدی دوباره تلاش کنه.
+    if not message_ids:
+        print("Broadcast delivered no messages; keeping cycle idle to retry next run.")
+        state["daily"] = {"date": None, "status": "idle"}
+        return
+
     state["daily"] = {
         "date": today_str,
         "status": "awaiting",
@@ -366,6 +431,10 @@ def progress_cycle_if_needed(state: dict) -> None:
         keyboard = make_theme_keyboard(new_themes)
         text = "باشه، بذار گزینه‌های جدید پیشنهاد بدم 🔄\n\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(new_themes))
         message_ids = broadcast(state, text, reply_markup=keyboard)
+        if not message_ids:
+            # ارسال گزینه‌های جدید موفق نبود؛ pending_choice رو نگه دار تا ران بعدی دوباره تلاش کنه
+            print("Failed to broadcast new theme options; will retry next run.")
+            return
         daily.update({
             "themes": new_themes,
             "message_ids": message_ids,
@@ -376,10 +445,30 @@ def progress_cycle_if_needed(state: dict) -> None:
         })
         return
 
-    final_theme = choice if choice != "none" else daily["themes"][0]
-    content = generate_content(final_theme)
-    broadcast(state, content)
+    # FIX: اگه کاربر تا سقف دفعات ❌ زده، به‌جای themes[0] (که همین الان ردش کرده)
+    # یه تم آماده‌ی ردنشده انتخاب کن.
+    if choice != "none":
+        final_theme = choice
+    else:
+        exhausted = daily.get("rejected", []) + daily.get("themes", [])
+        final_theme = _pick_fallback_themes(state["history"], exhausted)[0]
 
+    try:
+        content = generate_content(final_theme)
+    except Exception as e:
+        # تولید محتوا موقتاً نشد — به‌جای کرش و سکوت، یه بار اطلاع بده و
+        # pending_choice/awaiting رو نگه دار تا ران ساعتی بعدی خودش دوباره تلاش کنه.
+        print(f"Gemini failed to generate content, will retry next run: {e}")
+        if not daily.get("content_failed_notified"):
+            broadcast(
+                state,
+                "⚠️ تم امروز انتخاب شد ولی سرویس تولید محتوا موقتاً شلوغه. "
+                "خودکار دوباره تلاش می‌شه و محتوا به‌زودی میاد.",
+            )
+            daily["content_failed_notified"] = True
+        return
+
+    broadcast(state, content)
     state["history"].append(final_theme)
     daily["status"] = "done"
 
